@@ -3,6 +3,7 @@ package rate_envelope_queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"runtime/debug"
 	"sync"
@@ -13,7 +14,6 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"
 )
 
-// внутренний автомат состояний
 type QueueState int32
 
 const (
@@ -102,10 +102,10 @@ func NewRateEnvelopeQueue(base context.Context, name string, options ...func(*Ra
 		q.limiter = workqueue.NewTypedMaxOfRateLimiter[*Envelope]()
 	}
 	if q.limit <= 0 {
-		panic(service + ": limit must be greater than 0")
+		panic(fmt.Sprintf("%s - queue name %s : invalid limit %d", service, q.name, q.limit))
 	}
 	if q.stopMode == "" {
-		panic(service + ": stopMode must be set")
+		panic(fmt.Sprintf("%s - queue name %s : no stop mode", service, q.name))
 	}
 	// в init очередь ещё не «живая»
 	q.run.Store(false)
@@ -173,14 +173,14 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 	queue := q.queue
 	q.queueMu.RUnlock()
 	if queue == nil {
-		log.Printf(service + ": worker: queue is nil; exiting")
+		log.Printf(fmt.Sprintf("%s - queue %s : no queue %s", service, q.name, q.name))
 		return
 	}
 
 	for {
 		envelope, shutdown := queue.Get()
 		if shutdown {
-			log.Printf(service + ": worker is shutting down")
+			log.Printf(fmt.Sprintf("%s - queue %s : worker is shutting down", service, q.name))
 			return
 		}
 
@@ -191,7 +191,7 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 				if r := recover(); r != nil {
 					// важен порядок: Forget до выхода (Done отработает после этого defer)
 					queue.Forget(envelope)
-					log.Printf(service+": panic recovered in envelope: %v\n%s", r, debug.Stack())
+					log.Printf(fmt.Sprintf("%s - queue %s : recovered from panic: %v\n%s", service, q.name, r, debug.Stack()))
 				}
 			}()
 
@@ -299,13 +299,13 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 						case DecisionStateRetryAfter:
 							delay, ok := payload[PayloadAfterField]
 							if !ok {
-								log.Printf(service + ": envelope failureHook did not return after field; using 30s, please customize field")
+								log.Printf(fmt.Sprintf("%s - queue name %s - envelope %s/%d : failureHook did not return after field; using 30s, please customize field", service, q.name, envelope._type, envelope.id))
 								delay = 30 * time.Second
 							}
 
 							delayInterval, assert := delay.(time.Duration)
 							if !assert {
-								log.Printf(service + ": envelope failureHook returned invalid after field; using 30s, please customize field")
+								log.Printf(fmt.Sprintf("%s - queue name %s - envelope %s/%d : failureHook returned invalid after field; using 30s, please customize field", service, q.name, envelope._type, envelope.id))
 								delayInterval = 30 * time.Second
 							}
 
@@ -337,7 +337,7 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 		}(envelope)
 
 		if err != nil {
-			log.Printf(service+": envelope %s/%d error: %v", envelope._type, envelope.id, err)
+			log.Printf(fmt.Sprintf("%s - queue %s : worker envelope processing error %s/%d: %v", service, q.name, envelope._type, envelope.id, err))
 		}
 	}
 }
@@ -434,12 +434,12 @@ func (q *RateEnvelopeQueue) Start() {
 
 	switch q.CurrentState() {
 	case StateTerminate:
-		log.Printf(service + ": queue is terminated; Start skipped")
+		log.Printf(fmt.Sprintf("%s - queue %s : cannot start terminated queue", service, q.name))
 		return
 	case StateRunning:
 		return
 	case StateStopping:
-		log.Printf(service + ": queue is stopping; Start skipped")
+		log.Printf(fmt.Sprintf("%s - queue %s : cannot start stopping queue", service, q.name))
 		return
 	}
 
@@ -550,7 +550,7 @@ func (q *RateEnvelopeQueue) Stop() {
 	q.runCtx = nil
 	q.runCancel = nil
 
-	log.Printf(service + ": queue is drained/stopped")
+	log.Printf(fmt.Sprintf("%s - queue %s : stopped", service, q.name))
 }
 
 func (q *RateEnvelopeQueue) Terminate() {
