@@ -594,7 +594,7 @@ func (q *RateEnvelopeQueue) Drain() {
 
 func (q *RateEnvelopeQueue) Terminate() {
 	q.lifecycleMu.Lock()
-	if q.CurrentState() == StateStopped {
+	if q.CurrentState() != StateStopped {
 		q.lifecycleMu.Unlock()
 		return
 	}
