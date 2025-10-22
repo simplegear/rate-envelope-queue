@@ -553,6 +553,45 @@ func (q *RateEnvelopeQueue) Stop() {
 	log.Printf(fmt.Sprintf("%s - queue %s : stopped", service, q.name))
 }
 
+func (q *RateEnvelopeQueue) Drain() {
+	if q.stopMode != Drain {
+		return
+	}
+	// Разрешаем Drain только из Running-состояния.
+	q.lifecycleMu.Lock()
+	if q.CurrentState() != StateRunning {
+		q.lifecycleMu.Unlock()
+		return
+	}
+
+	q.run.Store(false)
+
+	// Снимок ссылки на очередь под тем же «зонтиком».
+	q.queueMu.RLock()
+	local := q.queue
+	q.queueMu.RUnlock()
+	q.lifecycleMu.Unlock()
+
+	if local != nil {
+		local.ShutDownWithDrain()
+	}
+
+	if q.waiting {
+		q.wg.Wait()
+
+		q.pendingMu.Lock()
+		pend := uint64(len(q.pending))
+		q.pendingMu.Unlock()
+
+		cur := q.currentCapacity.Load()
+		if cur > pend {
+			q.unreserve(cur - pend)
+		}
+	}
+
+	log.Printf(fmt.Sprintf("%s - queue %s : drained", service, q.name))
+}
+
 func (q *RateEnvelopeQueue) Terminate() {
 	q.lifecycleMu.Lock()
 	if q.CurrentState() == StateStopped {
