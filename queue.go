@@ -504,20 +504,16 @@ func (q *RateEnvelopeQueue) Stop() {
 	local := q.queue
 	q.queueMu.RUnlock()
 
-	if runCancel != nil {
-		defer runCancel()
-	}
-
 	// Сигнал остановки очереди.
 	if local != nil {
 		switch q.stopMode {
 		case Drain:
 			local.ShutDownWithDrain()
 		default: // Stop
-			local.ShutDown()
 			if runCancel != nil {
 				runCancel()
 			}
+			local.ShutDown()
 		}
 	}
 
