@@ -202,7 +202,7 @@ func TestQueue(t *testing.T) {
 
 			select {
 			case <-time.After(3 * time.Second):
-				assert.Equal(t, 0, len(invokeMarkCh))
+				assert.Equal(t, 2, len(invokeMarkCh)) // because waiting always is true on Stop mode and on Drain mode
 			}
 		}
 
@@ -255,7 +255,7 @@ func TestQueue(t *testing.T) {
 
 			select {
 			case <-time.After(3 * time.Second):
-				assert.Equal(t, 0, len(invokeMarkCh))
+				assert.Equal(t, 2, len(invokeMarkCh)) // because waiting always is true on Stop mode and on Drain mode
 			}
 		}
 

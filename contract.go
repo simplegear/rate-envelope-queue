@@ -32,7 +32,6 @@ type (
 	SingleQueuePool interface {
 		Send(envelopes ...*Envelope) error
 		Start()
-		Drain()
 		Stop()
 		Terminate()
 		CurrentState() QueueState
