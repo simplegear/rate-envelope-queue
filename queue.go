@@ -538,6 +538,10 @@ func (q *RateEnvelopeQueue) Stop() {
 	q.setState(StateStopped)
 	q.lifecycleMu.Unlock()
 
+	if runCancel != nil {
+		runCancel()
+	}
+
 	q.queueMu.Lock()
 	q.queue = nil
 	q.queueMu.Unlock()
