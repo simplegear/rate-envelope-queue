@@ -70,19 +70,15 @@ type RateEnvelopeQueue struct {
 // NewRateEnvelopeQueue по умолчанию workqueue теряет задачи в режиме AddAfter при любой остановке очереди.
 // ----------------------------------------------------------------------------------
 // аккуратный режим остановки, прочитаем все что в очереди
-// WithWaitingOption(true),
 // WithStopModeOption(Drain),
 // ----------------------------------------------------------------------------------
 // корректно, если нужен «почти drain», но без жёсткого ожидания всех воркеров
-// WithWaitingOption(false),
 // WithStopModeOption(Drain),
 // ----------------------------------------------------------------------------------
 // корректно для «быстрого, но чистого» останова с ожиданием
-// WithWaitingOption(true),
 // WithStopModeOption(Stop),
 // ----------------------------------------------------------------------------------
 // мгновернный останов без ожидания, все теряем
-// WithWaitingOption(false),
 // WithStopModeOption(Stop),
 // ----------------------------------------------------------------------------------
 func NewRateEnvelopeQueue(base context.Context, name string, options ...func(*RateEnvelopeQueue)) SingleQueuePool {
@@ -90,7 +86,7 @@ func NewRateEnvelopeQueue(base context.Context, name string, options ...func(*Ra
 	q := &RateEnvelopeQueue{
 		terminateCtx:    terminateCtx,
 		terminateCancel: cancel,
-		waiting:         true,
+		waiting:         true, // always true; see WithWaitingOption
 		state:           StateInit,
 		name:            name,
 	}
@@ -487,6 +483,9 @@ func (q *RateEnvelopeQueue) Start() {
 	q.pendingMu.Unlock()
 }
 
+// Stop interrupts stoping with cancel of run context
+// In Drain mode, waits for queue to be drained
+// In Stop mode, interrupts workers immediately
 func (q *RateEnvelopeQueue) Stop() {
 	// Переводим состояние в stopping (под "зонтиком"), без долгих операций под локом.
 	q.lifecycleMu.Lock()
@@ -500,10 +499,6 @@ func (q *RateEnvelopeQueue) Stop() {
 
 	q.lifecycleMu.Unlock()
 
-	if runCancel != nil {
-		runCancel()
-	}
-
 	// Снимок ссылки на очередь (не обнуляем публикацию до финализации).
 	q.queueMu.RLock()
 	local := q.queue
@@ -515,6 +510,9 @@ func (q *RateEnvelopeQueue) Stop() {
 		case Drain:
 			local.ShutDownWithDrain()
 		default: // Stop
+			if runCancel != nil {
+				runCancel()
+			}
 			local.ShutDown()
 		}
 	}
@@ -533,9 +531,6 @@ func (q *RateEnvelopeQueue) Stop() {
 		if cur > pend {
 			q.unreserve(cur - pend)
 		}
-	} else {
-		// waiting=false: не трогаем счётчик — in-flight сами вызовут dec() позже.
-		// Для Stop хвост остаётся учтённым (задокументированная утечка до следующего корректного цикла).
 	}
 
 	// Финализируем состояние и публикуем отсутствие очереди.
@@ -551,45 +546,6 @@ func (q *RateEnvelopeQueue) Stop() {
 	q.runCancel = nil
 
 	log.Printf(fmt.Sprintf("%s - queue %s : stopped", service, q.name))
-}
-
-func (q *RateEnvelopeQueue) Drain() {
-	if q.stopMode != Drain {
-		return
-	}
-	// Разрешаем Drain только из Running-состояния.
-	q.lifecycleMu.Lock()
-	if q.CurrentState() != StateRunning {
-		q.lifecycleMu.Unlock()
-		return
-	}
-
-	q.run.Store(false)
-
-	// Снимок ссылки на очередь под тем же «зонтиком».
-	q.queueMu.RLock()
-	local := q.queue
-	q.queueMu.RUnlock()
-	q.lifecycleMu.Unlock()
-
-	if local != nil {
-		local.ShutDownWithDrain()
-	}
-
-	if q.waiting {
-		q.wg.Wait()
-
-		q.pendingMu.Lock()
-		pend := uint64(len(q.pending))
-		q.pendingMu.Unlock()
-
-		cur := q.currentCapacity.Load()
-		if cur > pend {
-			q.unreserve(cur - pend)
-		}
-	}
-
-	log.Printf(fmt.Sprintf("%s - queue %s : drained", service, q.name))
 }
 
 func (q *RateEnvelopeQueue) Terminate() {
@@ -639,12 +595,15 @@ func WithLimitOption(limit int) func(*RateEnvelopeQueue) {
 	}
 }
 
+// deprecated: waiting is always true in stop modes Drain and Stop
+// use WithStopModeOption instead this option
 func WithWaitingOption(waiting bool) func(*RateEnvelopeQueue) {
-	return func(q *RateEnvelopeQueue) {
-		q.waiting = waiting
-	}
+	return func(q *RateEnvelopeQueue) {}
 }
 
+// WithStopModeOption StopMode defines behavior of the queue on Stop()
+// "Drain" - wait for all enqueued items to be processed;
+// "Stop" - terminate workers immediately, losing enqueued items.
 func WithStopModeOption(mode StopMode) func(*RateEnvelopeQueue) {
 	return func(q *RateEnvelopeQueue) {
 		if mode != Drain && mode != Stop {
