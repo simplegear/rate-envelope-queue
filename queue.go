@@ -3,6 +3,7 @@ package rate_envelope_queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"runtime/debug"
 	"sync"
@@ -13,7 +14,6 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"
 )
 
-// внутренний автомат состояний
 type QueueState int32
 
 const (
@@ -34,6 +34,9 @@ type RateEnvelopeQueue struct {
 
 	terminateCtx    context.Context
 	terminateCancel context.CancelFunc
+
+	runCtx    context.Context
+	runCancel context.CancelFunc
 
 	limit         int
 	queueMu       sync.RWMutex
@@ -67,19 +70,15 @@ type RateEnvelopeQueue struct {
 // NewRateEnvelopeQueue по умолчанию workqueue теряет задачи в режиме AddAfter при любой остановке очереди.
 // ----------------------------------------------------------------------------------
 // аккуратный режим остановки, прочитаем все что в очереди
-// WithWaitingOption(true),
 // WithStopModeOption(Drain),
 // ----------------------------------------------------------------------------------
 // корректно, если нужен «почти drain», но без жёсткого ожидания всех воркеров
-// WithWaitingOption(false),
 // WithStopModeOption(Drain),
 // ----------------------------------------------------------------------------------
 // корректно для «быстрого, но чистого» останова с ожиданием
-// WithWaitingOption(true),
 // WithStopModeOption(Stop),
 // ----------------------------------------------------------------------------------
 // мгновернный останов без ожидания, все теряем
-// WithWaitingOption(false),
 // WithStopModeOption(Stop),
 // ----------------------------------------------------------------------------------
 func NewRateEnvelopeQueue(base context.Context, name string, options ...func(*RateEnvelopeQueue)) SingleQueuePool {
@@ -87,7 +86,7 @@ func NewRateEnvelopeQueue(base context.Context, name string, options ...func(*Ra
 	q := &RateEnvelopeQueue{
 		terminateCtx:    terminateCtx,
 		terminateCancel: cancel,
-		waiting:         true,
+		waiting:         true, // always true; see WithWaitingOption
 		state:           StateInit,
 		name:            name,
 	}
@@ -99,10 +98,10 @@ func NewRateEnvelopeQueue(base context.Context, name string, options ...func(*Ra
 		q.limiter = workqueue.NewTypedMaxOfRateLimiter[*Envelope]()
 	}
 	if q.limit <= 0 {
-		panic(service + ": limit must be greater than 0")
+		panic(fmt.Sprintf("%s - queue name %s : invalid limit %d", service, q.name, q.limit))
 	}
 	if q.stopMode == "" {
-		panic(service + ": stopMode must be set")
+		panic(fmt.Sprintf("%s - queue name %s : no stop mode", service, q.name))
 	}
 	// в init очередь ещё не «живая»
 	q.run.Store(false)
@@ -170,14 +169,14 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 	queue := q.queue
 	q.queueMu.RUnlock()
 	if queue == nil {
-		log.Printf(service + ": worker: queue is nil; exiting")
+		log.Printf(fmt.Sprintf("%s - queue %s : no queue %s", service, q.name, q.name))
 		return
 	}
 
 	for {
 		envelope, shutdown := queue.Get()
 		if shutdown {
-			log.Printf(service + ": worker is shutting down")
+			log.Printf(fmt.Sprintf("%s - queue %s : worker is shutting down", service, q.name))
 			return
 		}
 
@@ -188,7 +187,7 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 				if r := recover(); r != nil {
 					// важен порядок: Forget до выхода (Done отработает после этого defer)
 					queue.Forget(envelope)
-					log.Printf(service+": panic recovered in envelope: %v\n%s", r, debug.Stack())
+					log.Printf(fmt.Sprintf("%s - queue %s : recovered from panic: %v\n%s", service, q.name, r, debug.Stack()))
 				}
 			}()
 
@@ -296,13 +295,13 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 						case DecisionStateRetryAfter:
 							delay, ok := payload[PayloadAfterField]
 							if !ok {
-								log.Printf(service + ": envelope failureHook did not return after field; using 30s, please customize field")
+								log.Printf(fmt.Sprintf("%s - queue name %s - envelope %s/%d : failureHook did not return after field; using 30s, please customize field", service, q.name, envelope._type, envelope.id))
 								delay = 30 * time.Second
 							}
 
 							delayInterval, assert := delay.(time.Duration)
 							if !assert {
-								log.Printf(service + ": envelope failureHook returned invalid after field; using 30s, please customize field")
+								log.Printf(fmt.Sprintf("%s - queue name %s - envelope %s/%d : failureHook returned invalid after field; using 30s, please customize field", service, q.name, envelope._type, envelope.id))
 								delayInterval = 30 * time.Second
 							}
 
@@ -334,13 +333,13 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 		}(envelope)
 
 		if err != nil {
-			log.Printf(service+": envelope %s/%d error: %v", envelope._type, envelope.id, err)
+			log.Printf(fmt.Sprintf("%s - queue %s : worker envelope processing error %s/%d: %v", service, q.name, envelope._type, envelope.id, err))
 		}
 	}
 }
 
 func (q *RateEnvelopeQueue) isAlive(queue workqueue.TypedRateLimitingInterface[*Envelope]) bool {
-	return q.run.Load() && q.terminateCtx != nil && q.terminateCtx.Err() == nil &&
+	return q.run.Load() && q.runCtx != nil && q.runCtx.Err() == nil &&
 		q.CurrentState() == StateRunning && !queue.ShuttingDown()
 }
 
@@ -431,12 +430,12 @@ func (q *RateEnvelopeQueue) Start() {
 
 	switch q.CurrentState() {
 	case StateTerminate:
-		log.Printf(service + ": queue is terminated; Start skipped")
+		log.Printf(fmt.Sprintf("%s - queue %s : cannot start terminated queue", service, q.name))
 		return
 	case StateRunning:
 		return
 	case StateStopping:
-		log.Printf(service + ": queue is stopping; Start skipped")
+		log.Printf(fmt.Sprintf("%s - queue %s : cannot start stopping queue", service, q.name))
 		return
 	}
 
@@ -457,6 +456,8 @@ func (q *RateEnvelopeQueue) Start() {
 	q.setState(StateRunning)
 	q.run.Store(true)
 
+	q.runCtx, q.runCancel = context.WithCancel(q.terminateCtx)
+
 	// запустить воркеры
 	for i := 0; i < q.limit; i++ {
 		if q.waiting {
@@ -464,7 +465,7 @@ func (q *RateEnvelopeQueue) Start() {
 		}
 		go func() {
 			defer recoverWrap()
-			q.worker(q.terminateCtx)
+			q.worker(q.runCtx)
 		}()
 	}
 
@@ -482,6 +483,9 @@ func (q *RateEnvelopeQueue) Start() {
 	q.pendingMu.Unlock()
 }
 
+// Stop interrupts stoping with cancel of run context
+// In Drain mode, waits for queue to be drained
+// In Stop mode, interrupts workers immediately
 func (q *RateEnvelopeQueue) Stop() {
 	// Переводим состояние в stopping (под "зонтиком"), без долгих операций под локом.
 	q.lifecycleMu.Lock()
@@ -491,6 +495,8 @@ func (q *RateEnvelopeQueue) Stop() {
 	}
 	q.setState(StateStopping)
 	q.run.Store(false)
+	runCancel := q.runCancel
+
 	q.lifecycleMu.Unlock()
 
 	// Снимок ссылки на очередь (не обнуляем публикацию до финализации).
@@ -504,6 +510,9 @@ func (q *RateEnvelopeQueue) Stop() {
 		case Drain:
 			local.ShutDownWithDrain()
 		default: // Stop
+			if runCancel != nil {
+				runCancel()
+			}
 			local.ShutDown()
 		}
 	}
@@ -522,9 +531,6 @@ func (q *RateEnvelopeQueue) Stop() {
 		if cur > pend {
 			q.unreserve(cur - pend)
 		}
-	} else {
-		// waiting=false: не трогаем счётчик — in-flight сами вызовут dec() позже.
-		// Для Stop хвост остаётся учтённым (задокументированная утечка до следующего корректного цикла).
 	}
 
 	// Финализируем состояние и публикуем отсутствие очереди.
@@ -536,18 +542,26 @@ func (q *RateEnvelopeQueue) Stop() {
 	q.queue = nil
 	q.queueMu.Unlock()
 
-	log.Printf(service + ": queue is drained/stopped")
+	q.runCtx = nil
+	q.runCancel = nil
+
+	log.Printf(fmt.Sprintf("%s - queue %s : stopped", service, q.name))
 }
 
 func (q *RateEnvelopeQueue) Terminate() {
 	q.lifecycleMu.Lock()
-	if q.CurrentState() == StateStopped {
+	if q.CurrentState() != StateStopped {
 		q.lifecycleMu.Unlock()
-		q.setState(StateTerminate)
-		q.terminateCancel()
 		return
 	}
+	q.setState(StateTerminate)
+	termCancel := q.terminateCancel
 	q.lifecycleMu.Unlock()
+
+	if termCancel != nil {
+		termCancel()
+	}
+
 	return
 }
 
@@ -581,12 +595,15 @@ func WithLimitOption(limit int) func(*RateEnvelopeQueue) {
 	}
 }
 
+// deprecated: waiting is always true in stop modes Drain and Stop
+// use WithStopModeOption instead this option
 func WithWaitingOption(waiting bool) func(*RateEnvelopeQueue) {
-	return func(q *RateEnvelopeQueue) {
-		q.waiting = waiting
-	}
+	return func(q *RateEnvelopeQueue) {}
 }
 
+// WithStopModeOption StopMode defines behavior of the queue on Stop()
+// "Drain" - wait for all enqueued items to be processed;
+// "Stop" - terminate workers immediately, losing enqueued items.
 func WithStopModeOption(mode StopMode) func(*RateEnvelopeQueue) {
 	return func(q *RateEnvelopeQueue) {
 		if mode != Drain && mode != Stop {
