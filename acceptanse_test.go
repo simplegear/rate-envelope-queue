@@ -11,13 +11,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PavelAgarkov/rate-envelope-queue/provider"
 	"k8s.io/component-base/metrics/legacyregistry"
 )
 
 type User struct {
-	Name  string
-	Email string
-	Age   int
+	Name  string `json:"name"`
+	Email string `json:"email"`
+	Age   int    `json:"age"`
 }
 
 func Test_Acceptance(t *testing.T) {
@@ -39,7 +40,22 @@ func Test_Acceptance(t *testing.T) {
 		Email: "@gmail.com",
 		Age:   30,
 	}
+
+	redisProvider, err := provider.NewRedisProvider(
+		parent,
+		provider.RedisConfig{
+			Address:  "localhost:6379",
+			Username: "",
+			Password: "",
+			DB:       0,
+		},
+		"processing_table",
+		"fallback_table",
+	)
+	defer redisProvider.Close()
+
 	emailEnvelope, err := NewEnvelope(
+		WithDataProvider(redisProvider),
 		WithId(1),
 		WithType("email_1"),
 		//WithInterval(6*time.Second),
@@ -225,7 +241,7 @@ func Test_Acceptance(t *testing.T) {
 
 	start()
 	stop()
-	envelopeQueue.Terminate()
+	//envelopeQueue.Terminate()
 	err = envelopeQueue.Send(foodEnvelope)
 	if err != nil {
 		fmt.Println("add err after stop:", err)

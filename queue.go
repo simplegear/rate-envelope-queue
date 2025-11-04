@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/PavelAgarkov/rate-envelope-queue/provider"
 	"k8s.io/client-go/util/workqueue"
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"
 )
@@ -251,6 +252,12 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 			// ErrStopEnvelope — забыть и не перепланировать. Ошибка от пользователя о том, что задача больше не нужна
 			case errors.Is(important, ErrStopEnvelope):
 				queue.Forget(envelope)
+				if envelope.dataProvider != nil && envelope.internalId != "" {
+					err := q.replaceToFailureProvider(envelope)
+					if err != nil {
+						log.Printf(service+": envelope %s/%d: can't replace to failure data provider: %v", envelope._type, envelope.id, err)
+					}
+				}
 
 				return nil
 
@@ -313,6 +320,14 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 						}
 					}
 				}
+
+				if envelope.dataProvider != nil && envelope.internalId != "" {
+					err := q.replaceToFailureProvider(envelope)
+					if err != nil {
+						log.Printf(service+": envelope %s/%d: can't replace to failure data provider: %v", envelope._type, envelope.id, err)
+					}
+				}
+
 				return nil
 
 			default:
@@ -327,6 +342,13 @@ func (q *RateEnvelopeQueue) worker(ctx context.Context) {
 					hctx, cancel := withHookTimeout(tctx, envelope.deadline, frac, hardHookLimit)
 					envelope.successHook(hctx, envelope)
 					cancel()
+				}
+
+				if envelope.dataProvider != nil && envelope.internalId != "" {
+					err := envelope.dataProvider.FinishOne(tctx, provider.Kv{Key: envelope.internalId})
+					if err != nil {
+						log.Printf(service+": envelope %s/%d: can't finish in data provider: %v", envelope._type, envelope.id, err)
+					}
 				}
 				return nil
 			}
@@ -380,6 +402,12 @@ func (q *RateEnvelopeQueue) Send(envelopes ...*Envelope) error {
 				}
 				q.pending = append(q.pending, envelopes...)
 				q.pendingMu.Unlock()
+
+				err := q.passToDataProvider(envelopes)
+				if err != nil {
+					return ErrPassToDataProvider
+				}
+
 				return nil
 			}
 			q.pendingMu.Unlock()
@@ -413,6 +441,11 @@ func (q *RateEnvelopeQueue) Send(envelopes ...*Envelope) error {
 				local.Add(e)
 			}
 			q.lifecycleMu.Unlock()
+			err := q.passToDataProvider(envelopes)
+			if err != nil {
+				return ErrPassToDataProvider
+			}
+
 			return nil
 
 		case StateStopping, StateStopped:
@@ -422,6 +455,73 @@ func (q *RateEnvelopeQueue) Send(envelopes ...*Envelope) error {
 			return ErrEnvelopeQueueIsNotRunning
 		}
 	}
+}
+
+func (q *RateEnvelopeQueue) passToDataProvider(envelopes []*Envelope) error {
+	ctx, cancel := context.WithTimeout(q.terminateCtx, 5*time.Second)
+	for _, envelope := range envelopes {
+		if envelope != nil && envelope.dataProvider != nil {
+			pk, err := envelope.dataProvider.GenerateProcessingPK()
+			if err != nil {
+				cancel()
+				return fmt.Errorf("envelope %s/%d: %v", envelope._type, envelope.id, err)
+			}
+			kv := provider.Kv{
+				Key:   pk,
+				Value: envelope.payload,
+			}
+			err = envelope.dataProvider.SaveOne(ctx, kv)
+			if err != nil {
+				log.Printf(service+": failed to save envelope %s/%d to provider: %v", envelope._type, envelope.id, err)
+				cancel()
+				return fmt.Errorf("can't pass envelope to data provider: %w", err)
+			}
+			envelope.internalId = pk
+		}
+	}
+	cancel()
+	return nil
+}
+
+func (q *RateEnvelopeQueue) replaceToFailureProvider(envelope *Envelope) error {
+	ctx, cancel := context.WithTimeout(q.terminateCtx, 5*time.Second)
+	kv := provider.Kv{Key: envelope.internalId}
+	entity, err := envelope.dataProvider.TakeOne(ctx, kv)
+	if err != nil {
+		log.Printf(service+": envelope %s/%d: can't take from data provider: %v", envelope._type, envelope.id, err)
+		cancel()
+	}
+	if entity != nil {
+		newPk, err := envelope.dataProvider.GenerateFallbackPK(kv.Key)
+		if err != nil {
+			log.Printf(service+": envelope %s/%d: can't generate fallback PK: %v", envelope._type, envelope.id, err)
+			cancel()
+
+			return fmt.Errorf("can't pass envelope to failure data provider: %w", err)
+		}
+		newKv := provider.Kv{
+			Key:   newPk,
+			Value: entity,
+		}
+
+		err = envelope.dataProvider.SaveOne(ctx, newKv)
+		if err != nil {
+			log.Printf(service+": envelope %s/%d: can't save to fallback in data provider: %v", envelope._type, envelope.id, err)
+			cancel()
+
+			return fmt.Errorf("can't pass envelope to failure data provider: %w", err)
+		}
+		err = envelope.dataProvider.FinishOne(ctx, kv)
+		if err != nil {
+			log.Printf(service+": envelope %s/%d: can't finish in data provider: %v", envelope._type, envelope.id, err)
+			cancel()
+
+			return fmt.Errorf("can't pass envelope to failure data provider: %w", err)
+		}
+	}
+	cancel()
+
+	return nil
 }
 
 func (q *RateEnvelopeQueue) Start() {

@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/PavelAgarkov/rate-envelope-queue/provider"
 )
 
 type Envelope struct {
 	id    uint64
 	_type string
+
+	internalId string
+	fallbackId string
 
 	interval time.Duration
 	deadline time.Duration
@@ -24,6 +29,8 @@ type Envelope struct {
 
 	stamps  []Stamp // per-envelope stamps
 	payload interface{}
+
+	dataProvider provider.DataProvider
 }
 
 func NewDynamicEnvelope(deadline time.Duration, invoke Invoker, payload interface{}) (*Envelope, error) {
@@ -144,5 +151,11 @@ func WithId(id uint64) func(*Envelope) {
 func WithPayload(p interface{}) func(*Envelope) {
 	return func(e *Envelope) {
 		e.payload = p
+	}
+}
+
+func WithDataProvider(dp provider.DataProvider) func(*Envelope) {
+	return func(e *Envelope) {
+		e.dataProvider = dp
 	}
 }

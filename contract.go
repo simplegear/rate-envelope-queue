@@ -13,6 +13,8 @@ var (
 	ErrAdditionEnvelopeToQueueBadFields    = errors.New(fmt.Sprintf("%s: addition envelope to queue has bad fields", service))
 	ErrAdditionEnvelopeToQueueBadIntervals = errors.New(fmt.Sprintf("%s: addition envelope to queue has bad intervals", service))
 	ErrAllowedQueueCapacityExceeded        = errors.New(fmt.Sprintf("%s: allowed queue capacity exceeded", service))
+
+	ErrPassToDataProvider = errors.New(fmt.Sprintf("%s: can't pass envelope to data provider", service))
 )
 
 type (

@@ -1,0 +1,46 @@
+services:
+  redis:
+    image: redis:7.2.1
+    hostname: redis1
+    container_name: rate-redis
+    ports:
+      - '6379:6379'
+    command: redis-server --save 20 1 --appendonly yes --loglevel warning
+    restart: unless-stopped
+    healthcheck:
+      test: [ 'CMD', 'redis-cli', 'ping' ]
+      interval: 2s
+      retries: 2
+      timeout: 2s
+    networks:
+      - rate-queue
+    volumes:
+      - redis-data:/data
+
+  postgres:
+    image: postgres:15.0
+    container_name: rate-postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready", "-d", "clients_database"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: qwerty12345
+      POSTGRES_DB: postgres
+    networks:
+      - rate-queue
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redis-data:
+
+networks:
+  rate-queue:
+    driver: bridge
